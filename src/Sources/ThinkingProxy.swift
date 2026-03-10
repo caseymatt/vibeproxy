@@ -3,17 +3,21 @@ import Network
 
 /**
  A lightweight HTTP proxy that intercepts requests to add extended thinking parameters
- for Claude models based on model name suffixes.
- 
- Model name pattern:
- - `*-thinking-NUMBER` → Custom token budget (e.g., claude-sonnet-4-5-20250929-thinking-5000)
- 
- The proxy strips the suffix and adds the `thinking` parameter to the request body
+ for Claude models and reasoning effort for GPT models based on model name suffixes.
+
+ Model name patterns:
+ - Claude: `*-thinking-NUMBER` → Custom token budget (e.g., claude-sonnet-4-5-20250929-thinking-5000)
+ - GPT: `model(effort)` → Reasoning effort level (e.g., gpt-5.4(xhigh), o3(high))
+
+ The proxy strips the suffix and adds the appropriate parameter to the request body
  before forwarding to CLIProxyAPI.
- 
+
  Examples:
  - claude-sonnet-4-5-20250929-thinking-2000 → 2,000 token budget
  - claude-sonnet-4-5-20250929-thinking-8000 → 8,000 token budget
+ - gpt-5.4(xhigh) → reasoning_effort: "xhigh"
+ - gpt-5.3-codex(high) → reasoning_effort: "high"
+ - o3(medium) → reasoning_effort: "medium"
  */
 struct VercelGatewayConfig {
     var enabled: Bool
@@ -290,6 +294,10 @@ class ThinkingProxy {
     /**
      Processes the JSON body to add thinking parameter if model name has a thinking suffix
      Returns tuple of (modifiedJSON, needsTransformation)
+
+     Supports:
+     - Claude models: `claude-*-thinking-NUMBER` → adds thinking.budget_tokens
+     - GPT models: `gpt-5.4(xhigh)` → adds reasoning_effort parameter
      */
     private func processThinkingParameter(jsonString: String) -> (String, Bool)? {
         guard let jsonData = jsonString.data(using: .utf8),
@@ -297,7 +305,37 @@ class ThinkingProxy {
               let model = json["model"] as? String else {
             return nil
         }
-        
+
+        // Process GPT/OpenAI models with reasoning effort syntax: gpt-5.4(xhigh), o3(high), etc.
+        if model.starts(with: "gpt-") || model.starts(with: "o1-") || model.starts(with: "o3") {
+            // Check for reasoning effort suffix pattern: model(effort)
+            // Valid efforts: none, low, medium, high, xhigh
+            let pattern = #"^(.+)\((none|low|medium|high|xhigh)\)$"#
+            if let regex = try? NSRegularExpression(pattern: pattern, options: []),
+               let match = regex.firstMatch(in: model, options: [], range: NSRange(model.startIndex..., in: model)) {
+
+                // Extract clean model name (group 1)
+                if let modelRange = Range(match.range(at: 1), in: model),
+                   let effortRange = Range(match.range(at: 2), in: model) {
+                    let cleanModel = String(model[modelRange])
+                    let effort = String(model[effortRange])
+
+                    json["model"] = cleanModel
+                    json["reasoning_effort"] = effort
+
+                    NSLog("[ThinkingProxy] Transformed GPT model '\(model)' → '\(cleanModel)' with reasoning_effort '\(effort)'")
+
+                    // Convert back to JSON
+                    if let modifiedData = try? JSONSerialization.data(withJSONObject: json),
+                       let modifiedString = String(data: modifiedData, encoding: .utf8) {
+                        return (modifiedString, false)  // false = no anthropic beta header needed
+                    }
+                }
+            }
+            // No reasoning suffix found, pass through unchanged
+            return (jsonString, false)
+        }
+
         // Only process Claude models (including gemini-claude variants)
         guard model.starts(with: "claude-") || model.starts(with: "gemini-claude-") else {
             return (jsonString, false)  // Not Claude, pass through
