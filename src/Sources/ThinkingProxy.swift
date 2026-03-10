@@ -1,6 +1,29 @@
 import Foundation
 import Network
 
+// MARK: - Debug Logging
+private let debugLogPath = NSHomeDirectory() + "/.vibeproxy-debug.log"
+private let debugLogQueue = DispatchQueue(label: "io.automaze.vibeproxy.debug-log")
+
+private func debugLog(_ message: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let logLine = "[\(timestamp)] \(message)\n"
+    debugLogQueue.async {
+        if let data = logLine.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: debugLogPath) {
+                if let handle = FileHandle(forWritingAtPath: debugLogPath) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                FileManager.default.createFile(atPath: debugLogPath, contents: data)
+            }
+        }
+    }
+    NSLog("[ThinkingProxy] %@", message)
+}
+
 /**
  A lightweight HTTP proxy that intercepts requests to add extended thinking parameters
  for Claude models and reasoning effort for GPT models based on model name suffixes.
@@ -212,7 +235,8 @@ class ThinkingProxy {
         let method = parts[0]
         let path = parts[1]
         let httpVersion = parts[2]
-        NSLog("[ThinkingProxy] Incoming request: \(method) \(path)")
+        debugLog("=== INCOMING REQUEST ===")
+        debugLog("Method: \(method), Path: \(path)")
 
         // Collect headers while preserving original casing
         var headers: [(String, String)] = []
@@ -266,21 +290,28 @@ class ThinkingProxy {
         // Try to parse and modify JSON body for POST requests
         var modifiedBody = bodyString
         var thinkingEnabled = false
-        
+
+        debugLog("Body preview: \(String(bodyString.prefix(300)))...")
+
         if method == "POST" && !bodyString.isEmpty {
+            debugLog("Processing POST body for thinking/reasoning parameters")
             if let result = processThinkingParameter(jsonString: bodyString) {
                 modifiedBody = result.0
                 thinkingEnabled = result.1
+                debugLog("Body processing complete. thinkingEnabled=\(thinkingEnabled)")
+            } else {
+                debugLog("processThinkingParameter returned nil")
             }
         }
-        
+
         // Route Claude requests through Vercel AI Gateway when configured
         if vercelConfig.isActive && method == "POST" && isClaudeModelRequest(body: modifiedBody) {
-            NSLog("[ThinkingProxy] Routing Claude request via Vercel AI Gateway")
+            debugLog("Routing Claude request via Vercel AI Gateway")
             forwardToVercel(method: method, path: "/v1/messages", version: httpVersion, headers: headers, body: modifiedBody, thinkingEnabled: thinkingEnabled, originalConnection: connection)
             return
         }
-        
+
+        debugLog("Forwarding to CLIProxyAPI at \(targetHost):\(targetPort), path: \(rewrittenPath)")
         forwardRequest(method: method, path: rewrittenPath, version: httpVersion, headers: headers, body: modifiedBody, thinkingEnabled: thinkingEnabled, originalConnection: connection)
     }
     
@@ -300,21 +331,34 @@ class ThinkingProxy {
      - GPT models: `gpt-5.4(xhigh)` → adds reasoning_effort parameter
      */
     private func processThinkingParameter(jsonString: String) -> (String, Bool)? {
+        debugLog("processThinkingParameter called with body length: \(jsonString.count)")
+
         guard let jsonData = jsonString.data(using: .utf8),
               var json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
               let model = json["model"] as? String else {
+            debugLog("Failed to parse JSON or extract model")
             return nil
         }
 
-        // Process GPT/OpenAI models with reasoning effort syntax: gpt-5.4(xhigh), o3(high), etc.
+        debugLog("Incoming model: '\(model)'")
+
+        // Process GPT/OpenAI models with reasoning effort syntax
+        // Supports BOTH formats:
+        //   - gpt-5.4(xhigh) - parentheses syntax
+        //   - gpt-5.4-xhigh  - dash syntax (Factory sanitizes parentheses to dashes)
         if model.starts(with: "gpt-") || model.starts(with: "o1-") || model.starts(with: "o3") {
-            // Check for reasoning effort suffix pattern: model(effort)
+            debugLog("Detected GPT/OpenAI model, checking for reasoning effort suffix")
+
             // Valid efforts: none, low, medium, high, xhigh
-            let pattern = #"^(.+)\((none|low|medium|high|xhigh)\)$"#
-            if let regex = try? NSRegularExpression(pattern: pattern, options: []),
+            let validEfforts = ["none", "low", "medium", "high", "xhigh"]
+
+            // Try parentheses syntax first: gpt-5.4(xhigh)
+            let parenPattern = #"^(.+)\((none|low|medium|high|xhigh)\)$"#
+            if let regex = try? NSRegularExpression(pattern: parenPattern, options: []),
                let match = regex.firstMatch(in: model, options: [], range: NSRange(model.startIndex..., in: model)) {
 
-                // Extract clean model name (group 1)
+                debugLog("Parentheses syntax matched!")
+
                 if let modelRange = Range(match.range(at: 1), in: model),
                    let effortRange = Range(match.range(at: 2), in: model) {
                     let cleanModel = String(model[modelRange])
@@ -323,15 +367,37 @@ class ThinkingProxy {
                     json["model"] = cleanModel
                     json["reasoning_effort"] = effort
 
-                    NSLog("[ThinkingProxy] Transformed GPT model '\(model)' → '\(cleanModel)' with reasoning_effort '\(effort)'")
+                    debugLog("Transformed GPT model '\(model)' → '\(cleanModel)' with reasoning_effort '\(effort)'")
 
-                    // Convert back to JSON
                     if let modifiedData = try? JSONSerialization.data(withJSONObject: json),
                        let modifiedString = String(data: modifiedData, encoding: .utf8) {
-                        return (modifiedString, false)  // false = no anthropic beta header needed
+                        debugLog("Modified body: \(String(modifiedString.prefix(500)))...")
+                        return (modifiedString, false)
                     }
                 }
             }
+
+            // Try dash syntax: gpt-5.4-xhigh (Factory converts parentheses to dashes)
+            for effort in validEfforts {
+                let suffix = "-\(effort)"
+                if model.hasSuffix(suffix) {
+                    let cleanModel = String(model.dropLast(suffix.count))
+                    debugLog("Dash syntax matched! Suffix: \(suffix)")
+
+                    json["model"] = cleanModel
+                    json["reasoning_effort"] = effort
+
+                    debugLog("Transformed GPT model '\(model)' → '\(cleanModel)' with reasoning_effort '\(effort)'")
+
+                    if let modifiedData = try? JSONSerialization.data(withJSONObject: json),
+                       let modifiedString = String(data: modifiedData, encoding: .utf8) {
+                        debugLog("Modified body: \(String(modifiedString.prefix(500)))...")
+                        return (modifiedString, false)
+                    }
+                }
+            }
+
+            debugLog("No reasoning effort suffix found in GPT model name")
             // No reasoning suffix found, pass through unchanged
             return (jsonString, false)
         }
@@ -783,9 +849,11 @@ class ThinkingProxy {
             if let data = data, !data.isEmpty {
                 // Check if response is a 404
                 if let responseString = String(data: data, encoding: .utf8) {
-                    // Log first 200 chars to debug
-                    let preview = String(responseString.prefix(200))
-                    NSLog("[ThinkingProxy] Response preview for \(path): \(preview)")
+                    // Log first 500 chars to debug
+                    let preview = String(responseString.prefix(500))
+                    debugLog("=== RESPONSE from CLIProxyAPI ===")
+                    debugLog("Path: \(path)")
+                    debugLog("Response preview: \(preview)")
                     
                     // Check for 404 in status line OR in body
                     let is404 = responseString.contains("HTTP/1.1 404") || 
@@ -844,18 +912,29 @@ class ThinkingProxy {
     /**
      Streams response chunks iteratively (uses async scheduling instead of recursion to avoid stack buildup)
      */
+    private var hasLoggedFirstChunk = false
     private func streamNextChunk(from targetConnection: NWConnection, to originalConnection: NWConnection) {
         targetConnection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
-            
+
             if let error = error {
-                NSLog("[ThinkingProxy] Receive response error: \(error)")
+                debugLog("Receive response error: \(error)")
                 targetConnection.cancel()
                 originalConnection.cancel()
                 return
             }
-            
+
             if let data = data, !data.isEmpty {
+                // Log first chunk of response
+                if !self.hasLoggedFirstChunk {
+                    self.hasLoggedFirstChunk = true
+                    if let responseStr = String(data: data, encoding: .utf8) {
+                        debugLog("=== FIRST RESPONSE CHUNK ===")
+                        debugLog("Size: \(data.count) bytes")
+                        debugLog("Content: \(String(responseStr.prefix(500)))")
+                    }
+                }
+
                 // Forward response chunk to original client
                 originalConnection.send(content: data, completion: .contentProcessed({ sendError in
                     if let sendError = sendError {
